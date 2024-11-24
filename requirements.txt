@@ -1,0 +1,27 @@
+clean-text
+GPUtil
+humanize
+joblib
+librosa
+moviepy
+natsort
+neuspell
+numpy
+packaging
+pandas
+psutil
+pydub
+pysbd
+requests
+setuptools
+spacy
+symspellpy
+torch
+tqdm
+transformers
+wordninja
+wrapt
+yake
+# Added dependencies for alignment
+dtaidistance
+silero-vad
