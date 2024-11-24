@@ -513,7 +513,7 @@ def transcribe_video_whisper(
     clip_directory,
     clip_name: str,
     chunk_dur: int = 30,
-    chunk_max_new_tokens=444,
+    chunk_max_new_tokens=448,
     temp_dir: str = "audio_chunks",
     manually_clear_cuda_cache=False,
     print_memory_usage=False,
@@ -522,7 +522,7 @@ def transcribe_video_whisper(
     language=None,
 ) -> dict:
     """
-    Transcribe video using Whisper + forced alignment for accurate timestamps
+    Transcribe video using Whisper and generate SRT files with accurate timestamps.
     """
     logging.info(f"Starting to transcribe {clip_name}")
     if verbose:
@@ -533,151 +533,74 @@ def transcribe_video_whisper(
         clip_name, clip_directory, ac_storedir, chunk_dur, verbose=verbose
     )
     gc.collect()
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    logging.info(f"transcribing on {device}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Transcribing on {device}")
     full_transc = []
-    GPU_update_incr = (
-        math.ceil(len(chunk_directory) / 2) if len(chunk_directory) > 1 else 1
-    )
-
-    # Initialize srt_entries list if generating SRT
-    srt_entries = [] if generate_srt else None
+    srt_entries = []
     srt_counter = 1
-
-    if generate_srt:
-        logging.info("SRT generation enabled")
-        logging.warning(
-            "Note: SRT timestamps from Whisper may not be perfectly synced with speech. "
-            "For precise lip-sync, consider using additional forced alignment tools like WhisperX"
-        )
 
     model = model.to(device)
     pbar = tqdm(total=len(chunk_directory), desc="Transcribing video")
-
-    # Load alignment model if generating SRT
-    align_model = None
-    align_processor = None
-    if generate_srt:
-        logging.info("Loading alignment model for accurate timestamps")
-        align_model, align_processor = load_wav2vec2_alignment_model(language)
-        if align_model:
-            align_model = align_model.to(device)
-        else:
-            logging.warning("Failed to load alignment model, falling back to basic timestamps")
 
     # Process each chunk
     for i, audio_chunk in enumerate(chunk_directory):
         try:
             # Load audio
-            audio_input, clip_sr = librosa.load(
+            audio_input, _ = librosa.load(
                 join(ac_storedir, audio_chunk), sr=16000
             )
 
-            # Detect speech segments using VAD
-            speech_segments = None
-            if generate_srt:
-                speech_segments = detect_speech_segments(audio_input)
+            # Calculate the chunk's start time
+            chunk_start_time = i * chunk_dur
 
-            # Get Whisper transcription
+            # Get Whisper transcription with timestamps
             input_features = processor(
                 audio_input,
                 sampling_rate=16000,
                 return_tensors="pt"
             ).input_features.to(device)
 
-            outputs = model.generate(
-                input_features=input_features,
+            generated_ids = model.generate(
+                inputs=input_features,
                 max_new_tokens=chunk_max_new_tokens,
                 task="transcribe",
                 language=language if language else None,
-                return_timestamps=True,
-                output_hidden_states=False,
                 return_dict_in_generate=True,
+                output_scores=False,
+                no_repeat_ngram_size=3,
             )
-            
-            # Handle different output formats
-            if hasattr(outputs, 'sequences'):
-                transcription = processor.batch_decode(
-                    outputs.sequences,
-                    skip_special_tokens=True
-                )[0]
-            else:
-                # Handle case where outputs is the sequence tensor directly
-                transcription = processor.batch_decode(
-                    outputs,
-                    skip_special_tokens=True
-                )[0]
-            
-            logging.info(f"Transcription output: '{transcription}'")
-            
-            # If we have alignment model and speech segments, improve timestamps
-            if generate_srt and align_model and speech_segments:
-                try:
-                    # Perform forced alignment
-                    alignment = forced_alignment(
-                        audio_input, 
-                        transcription,
-                        align_model,
-                        align_processor,
-                        device
+
+            # Decode with timestamps
+            transcription = processor.batch_decode(
+                generated_ids.sequences, skip_special_tokens=True
+            )[0]
+
+            # Get word-level timestamps
+            decoded = processor.decode(
+                generated_ids.sequences[0],
+                skip_special_tokens=True,
+                output_word_offsets=True,
+                return_timestamps='word',
+            )
+
+            words = decoded.words
+            text = decoded.text
+
+            # Append transcription text
+            full_transc.append(f"{text.strip()}\n")
+
+            # Generate SRT entries
+            if generate_srt:
+                for word_info in words:
+                    start_time = word_info.start + chunk_start_time
+                    end_time = word_info.end + chunk_start_time
+                    srt_entry = (
+                        f"{srt_counter}\n"
+                        f"{format_time_for_srt(start_time)} --> {format_time_for_srt(end_time)}\n"
+                        f"{word_info.word.strip()}\n\n"
                     )
-
-                    if not alignment:
-                        raise ValueError("Alignment failed to produce timestamps")
-
-                    # Create SRT entries with aligned timestamps
-                    words = transcription.split()
-                    current_segment = []
-                    current_start = None
-                    max_words_per_segment = 10
-                    
-                    for word_idx, word in enumerate(words):
-                        if word_idx < len(alignment):
-                            word_start = (alignment[word_idx][0] / 16000)
-                            word_end = (alignment[word_idx][1] / 16000)
-                            
-                            # Start new segment if needed
-                            if current_start is None:
-                                current_start = word_start
-                            
-                            current_segment.append(word)
-                            
-                            # Create SRT entry when segment is full or at last word
-                            if len(current_segment) >= max_words_per_segment or word_idx == len(words) - 1:
-                                srt_entry = (
-                                    f"{srt_counter}\n"
-                                    f"{format_time_for_srt(current_start)} --> {format_time_for_srt(word_end)}\n"
-                                    f"{' '.join(current_segment)}\n\n"
-                                )
-                                srt_entries.append(srt_entry)
-                                srt_counter += 1
-                                
-                                # Reset for next segment
-                                current_segment = []
-                                current_start = None
-                
-                    logging.info(f"Created {srt_counter-1} subtitle segments")
-
-                except Exception as e:
-                    logging.error(f"Error in forced alignment: {str(e)}")
-                    raise  # Re-raise instead of falling back
-
-            # Extract segments with timestamps
-            segments = outputs['segments']
-
-            # Calculate the chunk's start time
-            chunk_start_time = i * chunk_dur
-
-            # Adjust timestamps by adding the chunk's start time
-            for segment in segments:
-                start_time = segment['start'] + chunk_start_time
-                end_time = segment['end'] + chunk_start_time
-                text = segment['text']
-                srt_entry = f"{srt_counter}\n{format_time_for_srt(start_time)} --> {format_time_for_srt(end_time)}\n{text.strip()}\n\n"
-                srt_entries.append(srt_entry)
-                srt_counter += 1
-
-            # ... rest of the existing chunk processing code ...
+                    srt_entries.append(srt_entry)
+                    srt_counter += 1
 
         except Exception as e:
             logging.error(f"Error processing chunk {i}: {str(e)}")
@@ -689,11 +612,12 @@ def transcribe_video_whisper(
         pbar.update()
 
     pbar.close()
-    logging.info("completed transcription")
+    logging.info("Completed transcription")
 
-    md_df = create_metadata_df()  # blank df with column names
+    # Prepare metadata
+    md_df = create_metadata_df()
     full_text = corr(" ".join(full_transc))
-    md_df.loc[len(md_df), :] = [
+    md_df.loc[len(md_df)] = [
         clip_name,
         len(chunk_directory),
         chunk_dur,
@@ -703,15 +627,14 @@ def transcribe_video_whisper(
         len(full_text),
         len(full_text.split(" ")),
     ]
-    md_df.transpose(
-        copy=False,
-    )
+
+    # Save results
     save_transc_results(
         out_dir=clip_directory,
         vid_name=clip_name,
         ttext=full_text,
         mdata=md_df,
-        srt_entries=srt_entries,  # This will now contain the entries if generate_srt=True
+        srt_entries=srt_entries if generate_srt else None,
         verbose=verbose,
     )
 
@@ -722,14 +645,8 @@ def transcribe_video_whisper(
     }
 
     if verbose:
-        print(f"finished transcription of {clip_name} - {get_timestamp()}")
-    logging.info(f"finished transcription of {clip_name} - {get_timestamp()}")
-
-    # Clean up alignment model
-    if align_model:
-        del align_model
-        if device == "cuda":
-            torch.cuda.empty_cache()
+        print(f"Finished transcription of {clip_name} - {get_timestamp()}")
+    logging.info(f"Finished transcription of {clip_name} - {get_timestamp()}")
 
     return transc_res
 
