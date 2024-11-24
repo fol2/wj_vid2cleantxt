@@ -532,7 +532,14 @@ def transcribe_video_whisper(
         clip_name, clip_directory, ac_storedir, chunk_dur, verbose=verbose
     )
     gc.collect()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Update device selection to match wav2vec2 function
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    if verbose:
+        print(f"CUDA available: {torch.cuda.is_available()}")
+        print(f"MPS available: {torch.backends.mps.is_available()}")
+        print(f"Selected device: {device}")
+
     logging.info(f"Transcribing on {device}")
     full_transc = []
     srt_entries = []
