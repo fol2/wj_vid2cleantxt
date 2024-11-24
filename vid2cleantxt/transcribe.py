@@ -513,7 +513,6 @@ def transcribe_video_whisper(
     clip_directory,
     clip_name: str,
     chunk_dur: int = 30,
-    chunk_max_new_tokens=448,
     temp_dir: str = "audio_chunks",
     manually_clear_cuda_cache=False,
     print_memory_usage=False,
@@ -560,44 +559,65 @@ def transcribe_video_whisper(
                 return_tensors="pt"
             ).input_features.to(device)
 
+            # Generate transcription with timestamps
             generated_ids = model.generate(
                 inputs=input_features,
-                max_new_tokens=chunk_max_new_tokens,
+                max_length=448,
+                return_timestamps=True,
                 task="transcribe",
                 language=language if language else None,
-                return_dict_in_generate=True,
-                output_scores=False,
                 no_repeat_ngram_size=3,
             )
 
-            # Decode with timestamps
-            transcription = processor.batch_decode(
-                generated_ids.sequences, skip_special_tokens=True
-            )[0]
+            # Convert token IDs to tokens
+            tokens = processor.tokenizer.convert_ids_to_tokens(generated_ids[0])
 
-            # Get word-level timestamps
-            decoded = processor.decode(
-                generated_ids.sequences[0],
-                skip_special_tokens=True,
-                output_word_offsets=True,
-                return_timestamps='word',
-            )
+            # Initialize variables
+            words = []
+            current_word = ''
+            current_word_start = None
 
-            words = decoded.words
-            text = decoded.text
+            # The timestamp tokens start from ID 50264 and represent time in 0.02s increments
+            timestamp_begin = processor.tokenizer.all_special_ids[-1] + 1  # 50264
+            time_increment = 0.02  # seconds per increment
 
-            # Append transcription text
+            for token_id, token in zip(generated_ids[0], tokens):
+                if token_id >= timestamp_begin:
+                    # This is a timestamp token
+                    timestamp = (token_id - timestamp_begin) * time_increment
+                    if current_word:
+                        # Save the current word with its start and end times
+                        words.append({
+                            'word': current_word.strip(),
+                            'start_time': current_word_start + chunk_start_time,
+                            'end_time': timestamp + chunk_start_time
+                        })
+                        current_word = ''
+                    current_word_start = timestamp
+                else:
+                    # Append the token to the current word
+                    decoded_token = processor.tokenizer.decode([token_id], skip_special_tokens=True)
+                    current_word += decoded_token
+
+            # Append any remaining word
+            if current_word and current_word_start is not None:
+                words.append({
+                    'word': current_word.strip(),
+                    'start_time': current_word_start + chunk_start_time,
+                    'end_time': current_word_start + chunk_start_time + time_increment
+                })
+
+            # Combine all tokens to get the text
+            text = processor.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
             full_transc.append(f"{text.strip()}\n")
 
             # Generate SRT entries
-            if generate_srt:
+            if generate_srt and words:
                 for word_info in words:
-                    start_time = word_info.start + chunk_start_time
-                    end_time = word_info.end + chunk_start_time
                     srt_entry = (
                         f"{srt_counter}\n"
-                        f"{format_time_for_srt(start_time)} --> {format_time_for_srt(end_time)}\n"
-                        f"{word_info.word.strip()}\n\n"
+                        f"{format_time_for_srt(word_info['start_time'])} --> {format_time_for_srt(word_info['end_time'])}\n"
+                        f"{word_info['word']}\n\n"
                     )
                     srt_entries.append(srt_entry)
                     srt_counter += 1
